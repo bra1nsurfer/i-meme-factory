@@ -1,0 +1,399 @@
+{-# STDLIB_VERSION 7 #-}
+{-# CONTENT_TYPE DAPP #-}
+{-# SCRIPT_TYPE ACCOUNT #-}
+
+let separator = "__"
+let wavesString = "WAVES"
+let contractFilename = "meme_im_calculator.ride"
+let mult8 = 100_000_000
+
+func wrapErr(s: String) = {
+  contractFilename + ": " + s
+}
+
+func throwErr(s: String) = {
+  throw(wrapErr(s))
+}
+
+func validateAddress(address: String) = {
+  addressFromString(address).isDefined()
+}
+
+let STATUS_EMPTY = 0          # Empty pool available to user
+let STATUS_READY = 1          # Puzzle pool is ready for swaps
+let STATUS_TARGET_REACHED = 2 # Puzzle pool curve target is reached
+let STATUS_TRANSFERRED = 3    # Puzzle Pool converted to WX Pool
+
+let kShutdown = "shutdown__flag"
+let kPriceAsset = "price__asset"
+let kListingVolume = "listing__volume"
+let kCreationFee = "setup__creationFee"
+
+let kCurveTarget = "setup__curveTarget"
+let kVirtualLiquidity = "setup__virtualLiquidity"
+let kPoolTokensList = "static_tokenIds"
+
+let kPoolContractHash = "pool__contract__hash"
+let kLastEmptyPoolIndex = "last__empty_pool__index"
+let kFirstEmptyPoolIndex = "first__empty__pool__index"
+func kPoolAddressFromIndex(index: Int) = ["pool", index.toString()].makeString(separator)
+func kPoolIndexFromAddress(address: Address) = ["pool", address.toString()].makeString(separator)
+func kPoolAsset(address: Address) = ["asset", address.toString()].makeString(separator)
+func kPoolStatus(index: Int) = ["pool", "status", index.toString()].makeString(separator)
+
+let kFactoryAddress = "factory__address"
+let factoryAddressOption = match this.getString(kFactoryAddress) {
+  case s: String => s.addressFromString()
+  case _: Unit => unit
+}
+let factoryAddress = factoryAddressOption.valueOrErrorMessage(wrapErr("invalid factory address"))
+
+let kWxSwapAddress = "wxswap__address"
+let wxSwapAddressOption = match factoryAddress.getString(kWxSwapAddress) {
+  case s: String => s.addressFromString()
+  case _ => unit
+}
+let wxSwapAddress = wxSwapAddressOption.valueOrErrorMessage(wrapErr("invalid wx swap address"))
+
+let kFeeCollectorAddress = "wxfee_address"
+let feeCollectorAddressOption = match factoryAddress.getString(kFeeCollectorAddress) {
+  case s: String => s.addressFromString()
+  case _ => unit
+}
+let feeCollectorAddress = feeCollectorAddressOption.valueOrErrorMessage(wrapErr("invalid fee collector address"))
+
+let kUserPoolsAddress = "userpools_address"
+let userPoolsAddressOption = match factoryAddress.getString(kUserPoolsAddress) {
+    case s: String => s.addressFromString()
+    case _ => unit
+}
+let userPoolsAddress = userPoolsAddressOption.valueOrErrorMessage(wrapErr("invalid user_pools dapp address"))
+
+let kAssetStoreAddress = "assetstore_address"
+let assetStoreAddressOption = match factoryAddress.getString(kAssetStoreAddress) {
+    case s: String => s.addressFromString()
+    case _ => unit
+}
+let assetStoreAddress = assetStoreAddressOption.valueOrErrorMessage(wrapErr("invalid asset_store dapp address"))
+
+let shutdown = factoryAddress.getBoolean(kShutdown).valueOrElse(false)
+
+let lastEmptyIndex = factoryAddress.getInteger(kLastEmptyPoolIndex).valueOrElse(0)
+let firstEmptyIndex = factoryAddress.getInteger(kFirstEmptyPoolIndex).valueOrElse(0)
+
+let listingVolume = factoryAddress.getInteger(kListingVolume).valueOrElse(0)
+let creationFee = factoryAddress.getInteger(kCreationFee).valueOrElse(0)
+
+let poolContractHash = factoryAddress.getBinary(kPoolContractHash)
+
+func parseAssetId(input: String) = {
+  if (input == wavesString) then unit else input.fromBase58String()
+}
+
+func assetIdToString(input: ByteVector|Unit) = {
+  if (input == unit) then wavesString else input.value().toBase58String()
+}
+
+func mustAddress(caller: Address, address: Address) = {
+  caller == address || throwErr("permission denied")
+}
+
+func mustThis(caller: Address) = {
+  mustAddress(caller, this)
+}
+
+func mustFactory(caller: Address) = {
+  mustAddress(caller, factoryAddress)
+}
+
+func checkContractScript(address: Address) = {
+  match (poolContractHash) {
+      case hash:ByteVector => (scriptHash(address) == hash)
+      case _ => true
+    }
+}
+
+func isPoolExists(poolAddress: Address) = factoryAddress.getInteger(kPoolIndexFromAddress(poolAddress)).isDefined()
+
+func getPoolId(poolAddress: Address) = factoryAddress.getInteger(kPoolIndexFromAddress(poolAddress)).valueOrErrorMessage("pool doesn't exists")
+
+func isPoolTargetReached(poolAddress: Address) = {
+  let poolStatus = factoryAddress.getInteger(kPoolStatus(getPoolId(poolAddress))).valueOrElse(-1)
+  
+  ([STATUS_TARGET_REACHED, STATUS_TRANSFERRED].containsElement(poolStatus))
+}
+
+func getBalance(address: Address, assetId: ByteVector|Unit) = {
+  match (assetId) {
+      case id:ByteVector => address.assetBalance(id)
+      case _ => address.wavesBalance().available
+    }
+}
+
+func isWxSwapActive(amountAssetString: String, priceAssetString: String) = {
+  let statusKey        = ["%s%s%s", "status", amountAssetString, priceAssetString].makeString(separator)
+  let statusKeyReverse = ["%s%s%s", "status", priceAssetString, amountAssetString].makeString(separator)
+
+  let pairStatus        = userPoolsAddress.getString(statusKey).valueOrElse("")
+  let reversePairStatus = userPoolsAddress.getString(statusKeyReverse).valueOrElse("")
+
+  (pairStatus == "active" || reversePairStatus == "active")
+}
+
+func genLogo(assetId: ByteVector|Unit) = {
+  let (color, assetName) = match assetId {
+      case b:ByteVector => {
+        let name = match assetInfo(b) {
+            case a:Asset => a.name
+            case _ => "%"
+          }
+        ((b.toInt() % 360).toString(), name)
+      }
+      case _ => ("200", "WAVES")
+    }
+  
+  let logo = "<svg width='30' height='30' xmlns='http://www.w3.org/2000/svg'><circle cx='15' cy='15' fill='hsl(" + color + ", 70%, 70%)' r='15'/><text x='50%' y='50%' text-anchor='middle' dominant-baseline='middle' font-size='18'>"+ assetName.take(1) +"</text></svg>"
+
+  logo
+}
+
+@Callable(i)
+func init(factoryAddressStr: String) = {
+  strict checkCaller = i.caller.mustThis()
+  
+  [
+    StringEntry(kFactoryAddress, factoryAddressStr)
+  ]
+}
+
+@Callable(i)
+func addEmptyPool(callerPublicKey: ByteVector, args: List[String]) = {
+  let newPoolAddress = addressFromPublicKey(callerPublicKey)
+  let newPoolIndex = lastEmptyIndex + 1
+
+  strict checks = [
+    !shutdown || throwErr("not allowed (shutdown)"),
+    checkContractScript(newPoolAddress) || throwErr("pool script is not allowed"),
+    !isPoolExists(newPoolAddress) || throwErr("pool address is already registered")
+  ]
+
+  let factoryActions = [
+    factoryAddress.invoke("integerEntry", [kLastEmptyPoolIndex, newPoolIndex], []),
+    factoryAddress.invoke("stringEntry",  [kPoolAddressFromIndex(newPoolIndex), newPoolAddress.toString()], []),
+    factoryAddress.invoke("integerEntry", [kPoolIndexFromAddress(newPoolAddress), newPoolIndex], []),
+    factoryAddress.invoke("integerEntry", [kPoolStatus(newPoolIndex), STATUS_EMPTY], [])
+  ]
+
+  (nil, factoryActions)
+}
+
+
+# Args:
+# [tokenName, tokenDescription, tokenQuantity]
+# Payments:
+# [Waves]
+@Callable(i)
+func createPool(callerPublicKey: ByteVector, args: List[String]) = {
+  let minPayment = listingVolume + creationFee
+  
+  strict checks = [
+    !shutdown || throwErr("Temporary shutdown"),
+    i.caller.mustFactory(),
+    lastEmptyIndex - firstEmptyIndex > 0 || throwErr("No empty pool available"),
+    i.payments[0].assetId == unit || throwErr("Payment should be in WAVES"),
+    i.payments[0].amount >= minPayment || throwErr("Payment should be greater or equal " + minPayment.toString() + " WAVELET"),
+    args[0].isDefined() || throwErr("Token name is not provided"),
+    args[1].isDefined() || throwErr("Token description is not provided"),
+    args[2].isDefined() || throwErr("Token quantity is not provided"),
+    args[2].parseInt() != unit || throwErr("Token quantity should be a number")
+  ]
+
+  let poolIndex = firstEmptyIndex + 1
+  let poolAddressString = factoryAddress.getStringValue(kPoolAddressFromIndex(poolIndex))
+  let poolAddress = poolAddressString.addressFromStringValue()
+  let callerAddress = callerPublicKey.addressFromPublicKey()
+
+  let poolDomain = poolAddressString.take(8)
+  let poolOwner = callerAddress.toString()
+  let tokenName = args[0]
+  let tokenDesc = args[1]
+  let tokenQuantity = args[2]
+
+  strict initPoolInvoke = factoryAddress.invoke("initPoolInvoke", 
+    [poolAddressString, [poolDomain, poolOwner, tokenName, tokenDesc, tokenQuantity]], 
+    [AttachedPayment(i.payments[0].assetId, i.payments[0].amount)]
+  )
+
+  let factoryActions = [
+    factoryAddress.invoke("integerEntry", [kFirstEmptyPoolIndex, poolIndex], []),
+    factoryAddress.invoke("integerEntry", [kPoolStatus(poolIndex), STATUS_READY], [])
+  ]
+
+  (nil, factoryActions)
+}
+
+@Callable(i)
+func notifyStatusUpdate(callerPublicKey: ByteVector, args: List[String]) = {
+  let poolAddress = addressFromPublicKey(callerPublicKey)
+
+  strict checks = [
+    isPoolExists(poolAddress) || throwErr("pool not found"),
+    i.caller.mustFactory()
+  ]
+
+  let poolIndex = factoryAddress.getIntegerValue(kPoolIndexFromAddress(poolAddress))
+
+  let newStatus = args[0].parseIntValue()
+  let factoryActions = [
+    factoryAddress.invoke("integerEntry", [kPoolStatus(poolIndex), newStatus], [])
+  ]
+
+  (nil, factoryActions)
+}
+
+# Args
+# _1 = amount asset id
+# _2 = price asset id
+@Callable(i)
+func isWxSwapActiveREADONLY(callerPublicKey: ByteVector, args: List[String]) = {
+  let amountAssetIdString = args[0]
+  let priceAssetIdString = args[1]
+
+  strict checks = [
+    i.caller.mustFactory()
+  ]
+
+  (nil, isWxSwapActive(amountAssetIdString, priceAssetIdString))
+}
+
+# Args
+# _1 = poolAddress
+# _2 = inAssetId
+# _3 = outAssetId
+# _4 = swap amount
+@Callable(i)
+func swapREADONLY(callerPublicKey: ByteVector, args: List[String]) = {
+  let poolAddress = args[0].addressFromStringValue()
+  let amountAssetIdString = args[1]
+  let priceAssetIdString = args[2]
+  let amount = args[3].parseIntValue()
+
+  strict checks = [
+    !shutdown || throwErr("Temporary shutdown"),
+    i.caller.mustFactory()
+  ]
+
+  if(isPoolTargetReached(poolAddress)) then {
+    # If target is reached use Wx Swap contract
+    let wxSwapResult = wxSwapAddress.invoke("swapCalculateREADONLY", [amount, amountAssetIdString, priceAssetIdString], []).exactAs[Int]
+    (nil, (wxSwapResult, "WxSwap"))
+  } else {
+    # If target is not reached use pool itself
+    let poolSwapResult = poolAddress.invoke("swapReadOnly", [amountAssetIdString, priceAssetIdString, amount], []).exactAs[Int]
+    (nil, (poolSwapResult, "iMemePool"))
+  }
+}
+
+# Args
+# _1 = poolAddress
+# _2 = outAssetId
+# _3 = minimum amount (slippage)
+@Callable(i)
+func swap(callerPublicKey: ByteVector, args: List[String]) = {
+  let callerAddress = callerPublicKey.addressFromPublicKey()
+  let poolAddress = args[0].addressFromStringValue()
+  let priceAssetIdString = args[1]
+  let priceAssetId = priceAssetIdString.parseAssetId()
+  let minimumAmount = args[2].parseIntValue()
+  
+  let assetInAmount = i.payments[0].amount
+  let assetInAssetId = i.payments[0].assetId
+
+  strict checks = [
+    !shutdown || throwErr("Temporary shutdown"),
+    i.caller.mustFactory(),
+    i.payments.size() == 1 || throwErr("exactly one payment is expected")
+  ]
+
+  strict outAssetBalanceBefore = this.getBalance(priceAssetId)
+  strict swapAction = if(isPoolTargetReached(poolAddress) && isWxSwapActive(assetInAssetId.assetIdToString(), priceAssetIdString)) then {
+    # WX Swap
+    # If target is reached swap on Wx Swap contract
+    wxSwapAddress.invoke("swap", [minimumAmount, priceAssetIdString, this.toString()], i.payments)
+  } else {
+    # Pool Swap
+    # If target is not reached swap on pool itself
+    poolAddress.invoke("swap", [priceAssetIdString, minimumAmount], i.payments)
+  }
+  strict outAssetBalanceAfter = this.getBalance(priceAssetId)
+
+  [
+    ScriptTransfer(callerAddress, (outAssetBalanceAfter-outAssetBalanceBefore), priceAssetId)
+  ]
+}
+
+@Callable(i)
+func transferPool(callerPublicKey: ByteVector, args: List[String]) = {
+  let callerAddress = callerPublicKey.addressFromPublicKey()
+  let poolAddress = args[0].addressFromStringValue()
+  let poolTokensStringList = poolAddress.getStringValue(kPoolTokensList).split(",")
+  let asset1 = poolTokensStringList[0].parseAssetId()
+  let asset2 = poolTokensStringList[1].parseAssetId()
+
+  let (poolAsset, wavesAsset) = if(asset1 == unit) then (asset2, asset1) else (asset1, asset2)
+
+  strict poolAssetBalanceBefore = factoryAddress.getBalance(poolAsset)
+  strict wavesAssetBalanceBefore = factoryAddress.getBalance(wavesAsset)
+  strict withdrawInvoke = factoryAddress.invoke("withdrawLiquidityFromPool", [poolAddress.bytes], [])
+  strict poolAssetBalanceAfter = factoryAddress.getBalance(poolAsset)
+  strict wavesAssetBalanceAfter = factoryAddress.getBalance(wavesAsset)
+
+  let poolAssetAmount = poolAssetBalanceAfter - poolAssetBalanceBefore
+  let wavesAmount = wavesAssetBalanceAfter - wavesAssetBalanceBefore
+  let logo = genLogo(poolAsset)
+
+  if(poolAssetAmount > 0 && wavesAmount > 0) then {
+    # burn 20%
+    let burnAmount = fraction(poolAssetAmount, 20, 100)
+    strict burnAction = factoryAddress.invoke("burn", [poolAsset, burnAmount], [])
+    # collect fee 20%
+    let feeWavesAmount = fraction(wavesAmount, 20, 100)
+    strict feeAction = factoryAddress.invoke("transferWaves", [feeCollectorAddress.bytes, feeWavesAmount], [])
+
+    strict registerAssetAction = factoryAddress.invoke("registerAsset", [
+      assetStoreAddress.bytes, 
+      poolAsset.assetIdToString(), 
+      logo, 
+      true
+    ], [])
+
+    strict createWxPoolAction = factoryAddress.invoke("createWxPool", [
+      userPoolsAddress.bytes,
+      poolAsset.assetIdToString(),
+      (poolAssetAmount - burnAmount),
+      wavesAsset.assetIdToString(),
+      (wavesAmount - feeWavesAmount)
+    ], [])
+
+    strict changeStatus = factoryAddress.invoke("integerEntry", [kPoolStatus(getPoolId(poolAddress)), STATUS_TRANSFERRED], [])
+    (nil)
+  } else {
+    throwErr("withdrawn amount from pool is too low")
+  }
+}
+
+@Verifier(tx)
+func verify() = {
+  let keyAdminAddressList = "%s__adminAddressList"
+  let keyAllowedTxId = "%s__txId"
+  let adminList = factoryAddress.getString(keyAdminAddressList).valueOrElse("").split("__")
+  
+  let byOwner = (if (adminList.size() >= 3) then {
+      false
+    } else {
+      sigVerify(tx.bodyBytes, tx.proofs[0], tx.senderPublicKey)
+  })
+
+  let byAdmins = (tx.id == factoryAddress.getString(keyAllowedTxId).valueOrElse("").fromBase58String())
+  byAdmins || byOwner
+}

@@ -1,0 +1,312 @@
+{-# STDLIB_VERSION 7 #-}
+{-# CONTENT_TYPE DAPP #-}
+{-# SCRIPT_TYPE ACCOUNT #-}
+
+let SEP = "__"
+let wavesString = "WAVES"
+let contractFilename = "meme_im_factory.ride"
+
+let kPriceAsset = "price__asset"
+let kShutdown = "shutdown__flag"
+let shutdown = getBoolean(kShutdown).valueOrElse(false)
+
+func wrapErr(s: String) = {
+  contractFilename + ": " + s
+}
+
+func throwErr(s: String) = {
+  throw(wrapErr(s))
+}
+
+######################
+# MULTISIG FUNCTIONS #
+######################
+let ADMIN_LIST_SIZE = 10
+let QUORUM = 3
+let TXID_BYTES_LENGTH = 32
+
+func keyAllowedTxIdVotePrefix(txId: String) = makeString(["%s%s%s", "allowTxId", txId], SEP)
+# Make Admin vote key 
+func keyFullAdminVote(prefix: String, adminAddress: String) = makeString([prefix, adminAddress], SEP)
+# Admin List key
+func keyAdminAddressList() = makeString(["%s", "adminAddressList"], SEP)
+# Allowed TXID key
+func keyAllowedTxId() = makeString(["%s", "txId"], SEP)
+
+func getAdminVote(prefix: String, admin: String) = {
+  let voteKey = keyFullAdminVote(prefix, admin)
+  getInteger(voteKey).valueOrElse(0)
+}
+
+func getAdminsList() = {
+  match (this.getString(keyAdminAddressList())) {
+    case s:String => s.split(SEP)
+    case _ => []
+  }
+}
+
+let adminList = getAdminsList()
+
+func isInAdminList(address: String) = {
+  adminList.containsElement(address)
+}
+
+# Generate List of keys with same prefix for all admins
+func genVotesKeysHelper(a: (List[String], String), adminAddress: String) = {
+  let (result, prefix) = a
+  (result :+ keyFullAdminVote(prefix, adminAddress), prefix)
+}
+func genVotesKeys(keyPrefix: String) = {
+  let (result, prefix) = FOLD<10>(adminList, ([], keyPrefix), genVotesKeysHelper)
+  result
+}
+
+# Count all votes for Prefix
+func countVotesHelper(result: Int, voteKey: String) = {
+  result + getInteger(voteKey).valueOrElse(0)
+}
+func countVotes(prefix: String) = {
+  let votes = genVotesKeys(prefix)
+  FOLD<10>(votes, 0, countVotesHelper)
+}
+
+# Generate DeleteEntry for all votes with Prefix
+func clearVotesHelper(result: List[DeleteEntry], key: String) = {
+  result :+ DeleteEntry(key) 
+}
+func getClearVoteEntries(prefix: String) = {
+  let votes = genVotesKeys(prefix)
+  FOLD<10>(votes, [], clearVotesHelper)
+}
+
+func voteINTERNAL(
+  callerAddressString: String, 
+  keyPrefix: String, 
+  minVotes: Int, 
+  voteResult: List[StringEntry|IntegerEntry|DeleteEntry]
+) = {
+  let voteKey = keyFullAdminVote(keyPrefix, callerAddressString)
+  let adminCurrentVote = getAdminVote(keyPrefix, callerAddressString)
+
+  strict err = if (!isInAdminList(callerAddressString)) then {
+    throwErr("Address: " + callerAddressString + " not in Admin list")
+  } else if (adminCurrentVote == 1) then {
+    throwErr(voteKey + " you already voted")
+  } else { unit }
+
+  let votes = countVotes(keyPrefix)
+  if (votes + 1 >= minVotes) then {
+    let clearVoteEntries = getClearVoteEntries(keyPrefix)
+    clearVoteEntries ++ voteResult
+  } else {
+    [ IntegerEntry(voteKey, 1) ]
+  }
+}
+##########################
+# MULTISIG FUNCTIONS END #
+##########################
+
+func validateAddress(address: String) = {
+  addressFromString(address).isDefined()
+}
+
+let kCalculatorAddress = "calculator__address"
+let calculatorAddressOption = match this.getString(kCalculatorAddress) {
+  case s: String => s.addressFromString()
+  case _: Unit => unit
+}
+let calculatorAddress = calculatorAddressOption.valueOrErrorMessage(wrapErr("invalid calculator address"))
+
+func mustAddress(i: Invocation, address: Address) = {
+  i.caller == address || throwErr("permission denied")
+}
+
+func mustThis(i: Invocation) = {
+  mustAddress(i, this)
+}
+
+func mustCalculator(i: Invocation) = {
+  mustAddress(i, calculatorAddress)
+}
+
+func parseAssetId(input: String) = {
+  if (input == wavesString) then unit else input.fromBase58String()
+}
+
+func assetIdToString(input: ByteVector|Unit) = {
+  if (input == unit) then wavesString else input.value().toBase58String()
+}
+
+@Callable(i)
+func init(
+  calculatorAddressStr: String
+) = {
+  strict checkCaller = i.mustThis()
+
+  (
+    [
+        StringEntry(kCalculatorAddress, calculatorAddressStr),
+        StringEntry(kPriceAsset, wavesString)
+    ]
+  , unit)
+}
+
+@Callable(i)
+func stringEntry(key: String, val: String) =
+  if (!shutdown && i.mustCalculator()) then ([StringEntry(key, val)], key) else throwErr("not allowed")
+
+@Callable(i)
+func integerEntry(key: String, val: Int) =
+  if (!shutdown && i.mustCalculator()) then ([IntegerEntry(key, val)], key) else throwErr("not allowed")
+
+@Callable(i)
+func booleanEntry(key: String, val: Boolean) =
+  if (!shutdown && i.mustCalculator()) then ([BooleanEntry(key, val)], key) else throwErr("not allowed")
+
+@Callable(i)
+func binaryEntry(key: String, val: ByteVector) =
+  if (!shutdown && i.mustCalculator()) then ([BinaryEntry(key, val)], key) else throwErr("not allowed")
+
+@Callable(i)
+func deleteEntry(key: String) =
+  if (!shutdown && i.mustCalculator()) then ([DeleteEntry(key)], key) else throwErr("not allowed")
+
+@Callable(i)
+func reissue(assetId: ByteVector, amount: Int, reissuable: Boolean) = 
+  if (!shutdown && i.mustCalculator()) then ([Reissue(assetId, amount, reissuable)], amount) else throwErr("not allowed")
+
+@Callable(i)
+func burn(assetId: ByteVector, amount: Int) = 
+  if (!shutdown && i.mustCalculator()) then ([Burn(assetId, amount)], amount) else throwErr("not allowed")
+
+@Callable(i)
+func transferAsset(recipientBytes: ByteVector, amount: Int, assetId: ByteVector) = 
+  if (!shutdown && i.mustCalculator()) then ([ScriptTransfer(Address(recipientBytes), amount, assetId)], amount) else throwErr("not allowed")
+
+@Callable(i)
+func transferAssets(recipientBytes: ByteVector, assetsList: List[ByteVector], amountsList: List[Int]) = {
+  if (!shutdown && i.mustCalculator()) then {
+    func addNewTransfer(acc: (List[ScriptTransfer], Int), nextAssetId: ByteVector) = {
+      let (transfers, j) = acc
+
+      let newTransfer = ScriptTransfer(
+        Address(recipientBytes),
+        amountsList[j],
+        assetsList[j]
+      )
+      let updatedTransfers = transfers :+ newTransfer
+      (updatedTransfers, j + 1)
+    }
+
+    let (assetsTransfers, _lastIndex) = FOLD<10>(assetsList, ([], 0), addNewTransfer)
+    (assetsTransfers, unit)
+  } else {
+    throwErr("not allowed")
+  }
+}
+
+@Callable(i)
+func transferWaves(recipientBytes: ByteVector, amount: Int) = 
+  if (!shutdown && i.mustCalculator()) then ([ScriptTransfer(Address(recipientBytes), amount, unit)], amount) else throwErr("not allowed")
+
+@Callable(i)
+func call(function: String, args: List[String]) = {
+  # To allow usage with node script evaluation (without payments)
+  # there is a bug(?) when function is called like expression
+  # Invocation structure doesn't contain "payments" key for some reason
+  let cleanPayments = if (i.callerPublicKey == base58'11111111111111111111111111111111') then [] else i.payments
+  let result = calculatorAddress.reentrantInvoke(function, [i.callerPublicKey, args], cleanPayments)
+
+  (nil, result)
+}
+
+@Callable(i)
+func initPoolInvoke(poolAddressString: String, args: List[String]) = {
+  if (!shutdown && i.mustCalculator()) then {
+    let convertedArgs = [
+      args[0],                # poolDomain
+      args[1],                # poolOwner
+      args[2],                # tokenName
+      args[3],                # tokenDesc
+      args[4].parseIntValue() # tokenQuantity
+    ]
+    (nil, addressFromStringValue(poolAddressString).invoke("init", convertedArgs, i.payments))
+  } else throwErr("not allowed")
+}
+
+@Callable(i)
+func withdrawLiquidityFromPool(poolAddress: ByteVector) = {
+  if (!shutdown && i.mustCalculator()) then {
+    (nil, Address(poolAddress).invoke("withdrawLiquidityAtTarget", [], []))
+  } else throwErr("not allowed")
+}
+
+# Function for the Puzzle Pool
+@Callable(i)
+func notifyStatusUpdate(status: Int) = {
+  func kPoolIndexFromAddress(address: Address) = ["pool", address.toString()].makeString(SEP)
+  func kPoolStatus(index: Int) = ["pool", "status", index.toString()].makeString(SEP)
+
+  let poolAddress = i.caller
+  let poolIndex = this.getIntegerValue(kPoolIndexFromAddress(poolAddress))
+
+  [IntegerEntry(kPoolStatus(poolIndex), status)]
+}
+
+# Function for user_pools
+@Callable(i)
+func createWxPool(userPools: ByteVector, asset1Id: String, asset1Amount: Int, asset2Id: String, asset2Amount: Int) = {
+  if (!shutdown && i.mustCalculator()) then {
+    (nil, Address(userPools).invoke("create", [], [
+      AttachedPayment(asset1Id.parseAssetId(), asset1Amount),
+      AttachedPayment(asset2Id.parseAssetId(), asset2Amount)
+    ]))
+  } else throwErr("not allowed")
+}
+
+# Function for asset_store
+@Callable(i)
+func registerAsset(assetStore: ByteVector, assetId: String, logo: String, verified: Boolean) = {
+  if (!shutdown && i.mustCalculator()) then {
+    (nil, Address(assetStore).invoke("createOrUpdate", [
+      assetId,
+      logo,
+      verified
+    ], []))
+  } else throwErr("not allowed")
+}
+
+
+######################
+# MULTISIG FUNCTIONS #
+######################
+# Vote for txId that is allowed in Verifier
+@Callable(i)
+func voteForTxId(txId: String) = {
+  let callerAddressString = toBase58String(i.caller.bytes)
+  let keyPrefix = keyAllowedTxIdVotePrefix(txId)
+  let result = [ StringEntry(keyAllowedTxId(), txId) ]
+  let allowedTxIdOption = this.getString(keyAllowedTxId())
+  
+  strict err = [
+    txId.fromBase58String().size() == TXID_BYTES_LENGTH || throwErr(txId + " is not valid txId"),
+    allowedTxIdOption == unit || allowedTxIdOption.value() != txId || throwErr(txId + " is already allowed")
+  ]
+
+  voteINTERNAL(callerAddressString, keyPrefix, QUORUM, result)
+}
+##########################
+# MULTISIG FUNCTIONS END #
+##########################
+
+@Verifier(tx)
+func verify() = {
+  let byAdmins = (tx.id.toBase58String() == this.getString(keyAllowedTxId()).valueOrElse(""))
+  let byOwner = (if (adminList.size() >= QUORUM) then {
+      false
+    } else {
+      sigVerify(tx.bodyBytes, tx.proofs[0], tx.senderPublicKey)
+  })
+
+  byAdmins || byOwner
+}
